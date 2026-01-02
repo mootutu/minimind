@@ -1,3 +1,4 @@
+import math
 from transformers import PretrainedConfig
 
 
@@ -90,3 +91,125 @@ class RMSNorm(nn.Module):
     # forward
     def forward(self, x):
         return self.weight * self._norm().type.type_as(x)
+
+def precompute_freqs_cis(
+    dim: int,
+    end: int = int(32 * 1024),
+    rope_base: float = 1e6,
+    rope_scaling: Optional[dict] = None,
+):
+    """
+    预计算旋转位置编码（RoPE）的频率。
+
+    参数:
+        dim (int): 维度。
+        end (int, 可选): 推入的序列长度，默认值为 32768。
+        rope_base (float, 可选): 基础频率，默认值为 1e6。
+        rope_scaling (dict, 可选): 缩放参数，用于 YaRN 缩放，默认值为 None。
+
+    返回:
+        freqs_cos (torch.Tensor): 余弦频率，形状为 (end, dim // 2)。
+        freqs_sin (torch.Tensor): 正弦频率，形状为 (end, dim // 2)。
+    """
+    # 写出最初的 RoPE 式子
+    """
+    freqs_i = \frac{1}{rope_base^{\frac{2i}{dim}}}
+    两两旋转： freqs 这里是 i，而指数那里是 2i，因为是两两一组进行旋转
+    每个频率对应两个维度
+    """
+    freqs = 1.0 / rope_base ** torch.arange(0, dim, 2)[: dim // 2].float()/dim # 由于是两两一组进行旋转，所以以 2 为步长
+
+    # YaRN
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4),
+            rope_scaling.get("beta_slow", 1),
+        )
+
+        # 计算 corr_dim：从 0 开始，找第一个满足 波长 > 训练最大长度 的维度索引 i，也就是需要修正的维度，公式里面的 min 指的是最靠前的。为什么要找最靠前的？
+        corr_dim = next((i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max), dim // 2)
+
+        # 计算 power
+        power = torch.arange(0, dim//2, device=freqs.device).float() / max(dim//2 - 1, 1)
+
+        # 计算 beta
+        beta = beta_slow + (beta_fast - beta_slow) * power
+
+        # 计算 scale
+        scale = torch.where(
+            torch.arange(0, dim//2, device=freqs.device).float() < corr_dim,
+            (beta * factor - beta + 1)/beta * factor,
+            1.0 / factor
+        )
+
+        # 应用 scale
+        freqs = freqs * scale
+    # 生成位置索引，与频率相乘
+    t = torch.arange(end, device=freqs.device).float()
+    freqs = torch.outer(t, freqs).float() # [end, dim//2] 的矩阵
+
+    # 返回一个 cos 和 sin
+    freqs_cos = torch.cat((freqs.cos(), freqs.cos()), dim=-1)
+    freqs_sin = torch.cat((freqs.sin(), freqs.sin()), dim=-1)
+    return freqs_cos, freqs_sin
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    应用旋转位置编码（RoPE）到查询（q）和键（k）张量。
+
+    参数:
+        q (torch.Tensor): 查询张量，形状为 (..., seq_len, dim)。
+        k (torch.Tensor): 键张量，形状为 (..., seq_len, dim)。
+        cos (torch.Tensor): 余弦频率，形状为 (seq_len, dim // 2)。
+        sin (torch.Tensor): 正弦频率，形状为 (seq_len, dim // 2)。
+        unsqueeze_dim (int, 可选): 用于扩展维度的索引，默认值为 1。
+
+    返回:
+        q_embed (torch.Tensor): 编码后的查询张量，形状为 (..., seq_len, dim)。
+        k_embed (torch.Tensor): 编码后的键张量，形状为 (..., seq_len, dim)。
+    """
+
+    # 实数域上的旋转：[a, b] => [-b, a]
+    def rotate_half(x):
+        """
+        对输入张量 x 进行旋转，将最后一个维度的后半部分移动到前半部分，前半部分移动到后半部分。
+        
+        例如：
+            x = [x1, x2, x3, x4]
+            前半: [x1, x2]
+            后半: [x3, x4]
+            旋转后: [x3, x4, x1, x2]
+
+        参数:
+            x (torch.Tensor): 输入张量，形状为 (..., dim)。
+
+        返回:
+            torch.Tensor: 旋转后的张量，形状为 (..., dim)。
+        """ 
+        # x.shape[-1] 取最后一个维度的中点
+        # [-x[..., x.shape[-1] //2:] 取后半部分
+        # [x[..., :x.shape[-1] //2] 取前半部分
+        return torch.cat([-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]], dim=-1)
+    
+    # 应用旋转位置编码
+    # x_rotated = x  * cos + rotate_half(x) * sin
+    # unsqueeze 用于后续的维度扩展
+    # 计算 q_embed, k_embed
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+
+    return q_embed, k_embed
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # bs: batch size, slen: sequence length, num_key_value_heads: number of key value heads, head_dim: head dimension
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+
+    return (
+        x[:,:,:,None,:]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
